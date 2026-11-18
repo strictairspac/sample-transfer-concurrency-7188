@@ -1,0 +1,5 @@
+-- Schema is applied idempotently by SQLAlchemy metadata at startup.
+-- See src/models/entities.py for authoritative tables, constraints and relationships.
+-- Critical locking query (worker only):
+-- SELECT remaining FROM trial_balances WHERE trial_id = :id FOR UPDATE;
+-- SET LOCAL lock_timeout = '250ms';
