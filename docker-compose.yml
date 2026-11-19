@@ -1,14 +1,62 @@
 name: ${COMPOSE_PROJECT_NAME:-lock-lab}
+x-db-env: &db-env
+  POSTGRES_USER: locklab
+  POSTGRES_PASSWORD: ${DB_PASSWORD:-locklab_demo_pw}
+  POSTGRES_DB: locklab
 services:
   db:
     image: postgres:16-alpine
     container_name: ${COMPOSE_PROJECT_NAME:-lock-lab}-db
+    environment: *db-env
     environment:
-      POSTGRES_USER: locklab
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-locklab_demo_pw}
-      POSTGRES_DB: locklab
+      <<: *db-env
+      REPLICA_PASSWORD: ${REPLICA_PASSWORD:-replica_demo_pw}
     ports: ["${DB_PORT:-17742}:5432"]
-    volumes: [db-data:/var/lib/postgresql/data]
+    volumes:
+      - db-data:/var/lib/postgresql/data
+      - ./backend/migrations:/docker-entrypoint-initdb.d:ro
+    command:
+      - postgres
+      - -c
+      - wal_level=replica
+      - -c
+      - max_wal_senders=10
+      - -c
+      - wal_keep_size=256MB
+      - -c
+      - hot_standby=on
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U locklab -d locklab"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+  # 物理流复制热备：只承接移交台只读事务，回放可通过管理员接口暂停/恢复做演练
+  db-replica:
+    image: postgres:16-alpine
+    container_name: ${COMPOSE_PROJECT_NAME:-lock-lab}-db-replica
+    depends_on:
+      db: {condition: service_healthy}
+    environment:
+      PGUSER: replicator
+      PGPASSWORD: ${REPLICA_PASSWORD:-replica_demo_pw}
+    ports: ["${REPLICA_PORT:-17743}:5432"]
+    volumes: [db-replica-data:/var/lib/postgresql/data]
+    # 首次启动做基础备份并写入 standby.signal；已初始化则直接以热备形态启动
+    entrypoint: ["/bin/sh","-c"]
+    command:
+      - |
+        set -e
+        if [ ! -f /var/lib/postgresql/data/standby.signal ]; then
+          until pg_isready -h db -U locklab -d locklab; do sleep 1; done
+          rm -rf /var/lib/postgresql/data/*
+          pg_basebackup -h db -p 5432 -U replicator -D /var/lib/postgresql/data -X stream -R -c fast
+          # -R 写入的 primary_conninfo 不含密码，去重后写入完整连接串
+          sed -i '/^primary_conninfo/d' /var/lib/postgresql/data/postgresql.auto.conf
+          printf "primary_conninfo = 'host=db port=5432 user=replicator password=%s application_name=replica1'\nhot_standby = on\n" "$$PGPASSWORD" >> /var/lib/postgresql/data/postgresql.auto.conf
+          chown -R postgres:postgres /var/lib/postgresql/data
+        fi
+        exec postgres -c hot_standby=on
+    user: postgres
     healthcheck:
       test: [CMD-SHELL, "pg_isready -U locklab -d locklab"]
       interval: 3s
@@ -29,13 +77,35 @@ services:
     container_name: ${COMPOSE_PROJECT_NAME:-lock-lab}-backend
     environment: &env
       DATABASE_URL: postgresql+psycopg://locklab:${DB_PASSWORD:-locklab_demo_pw}@db:5432/locklab
+      REPLICA_URL: postgresql+psycopg://locklab:${DB_PASSWORD:-locklab_demo_pw}@db-replica:5432/locklab
       REDIS_URL: redis://redis:6379/0
       JWT_SECRET: ${JWT_SECRET:-local-lock-lab-change-before-public-use}
       SEED_DEMO: ${SEED_DEMO:-true}
+      ARTIFACTS_DIR: /artifacts
+      SERVER_ID: backend-1
     ports: ["${BACKEND_PORT:-19242}:8000"]
     volumes: [run-artifacts:/artifacts]
     depends_on:
       db: {condition: service_healthy}
+      db-replica: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+  # 第二个无状态后端：验证会话水位在 Redis 中共享、任意实例切换都能读己写
+  backend-2:
+    build: ./backend
+    container_name: ${COMPOSE_PROJECT_NAME:-lock-lab}-backend-2
+    environment:
+      <<: *env
+      SERVER_ID: backend-2
+    ports: ["${BACKEND2_PORT:-19243}:8000"]
+    volumes: [run-artifacts:/artifacts]
+    depends_on:
+      db: {condition: service_healthy}
+      db-replica: {condition: service_healthy}
       redis: {condition: service_healthy}
     healthcheck:
       test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
@@ -70,5 +140,6 @@ services:
       retries: 20
 volumes:
   db-data:
+  db-replica-data:
   redis-data:
   run-artifacts:

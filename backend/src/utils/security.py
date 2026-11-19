@@ -2,7 +2,9 @@ import hashlib,hmac,os,jwt
 from datetime import datetime,timedelta,timezone
 from fastapi import Depends, HTTPException
 from fastapi.security import HTTPBearer
+from jwt import InvalidTokenError
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from src.config.settings import JWT_SECRET
 from src.config.database import db_session
 from src.models.entities import User
@@ -16,10 +18,15 @@ def issue(user): return jwt.encode({'sub':str(user.id),'exp':datetime.now(timezo
 def current(token=Depends(bearer),db=Depends(db_session)):
     try:
         payload=jwt.decode(token.credentials,JWT_SECRET,algorithms=['HS256'])
+    except InvalidTokenError:
+        raise HTTPException(401,'登录已过期，请重新登录')
+    # JWT 本身有效但数据库不可用：是基础设施故障而不是凭证问题，必须按 503 暴露
+    try:
         user=db.get(User,int(payload['sub']))
-        if not user or user.role not in ROLES: raise ValueError()
-        return user
-    except Exception: raise HTTPException(401,'登录已过期，请重新登录')
+    except SQLAlchemyError:
+        raise HTTPException(503,'数据库当前无法读取，请稍后重试')
+    if not user or user.role not in ROLES: raise HTTPException(401,'登录已过期，请重新登录')
+    return user
 def writer(user=Depends(current)):
     if user.role not in ('operator','admin'): raise HTTPException(403,'观察员仅可查看和导出')
     return user
